@@ -1,6 +1,8 @@
-node_modules/
-dist/
+__pycache__/
+*.pyc
+.venv/
+venv/
 .env
 .DS_Store
 speeky_pgdata/
-/lib/generated/prisma
+prisma/generated/
