@@ -1,31 +1,28 @@
 """
-Confidence vs. Grammar module (US-21 / PDF US-053).
+Confidence vs. Grammar module (US-21 / PDF US-053 / BAS-US-11).
 
-Computes confidence_score from FluencyAnalyzer's audio delivery signals and
-grammar_score from GrammarCorrector's error_density, then generates the
-confidence-first feedback strategy defined by US-21.
+BREAKING CHANGE from the previous version: is_high_stakes_context (bool)
+is replaced by formality_tier (FormalityTier, from the new shared
+formality.py). Reason: WEC-US-03's acceptance criteria requires reusing
+"the same context tiers already defined for grammar tone adjustment
+(BAS-US-11)" — a boolean can't represent the 3-tier system WEC-US-03
+needs (Casual / Professional / Formal-High-Stakes), so this had to
+become the real shared tier system rather than staying a 2-way flag.
 
-Scoring reuses FluencyAnalyzer's OWN established point bands (speech rate,
-pause frequency, filled pauses) rather than inventing a new weighting
-scheme — see _calculate_confidence_score() docstring for exactly which
-existing bands are reused and why lexical diversity is excluded.
-
-US-21 Acceptance Criteria covered here:
-  - Primary displayed metric is confidence_score, never a grammar accuracy %.
-  - Minor grammar errors are demoted to a secondary "Minor Polish" tier
-    rather than being flagged as critical failures (grammar_tier).
-  - E-01 (Unintelligible Grammar): breaks from confidence-first model to
-    request clarification instead of silently scoring.
-  - E-02 (Professional Context Violation): grammar threshold tightens for
-    high-stakes contexts (is_high_stakes_context).
-  - E-03 (Repeat Grammatical Offender): after 10+ repeats of the same
-    error tag, surface one actionable tip in the feedback summary WITHOUT
-    tanking confidence_score. Implemented in _detect_repeat_offender().
+Computes confidence_score from FluencyAnalyzer's audio delivery signals
+and grammar_score from GrammarCorrector's error_density, then generates
+the confidence-first feedback strategy defined by US-21.
 """
 
 import logging
 from collections import Counter
-from typing import Dict, List, Optional
+from typing import Callable, Dict, List, Optional
+
+import numpy as np
+
+from .fluency import FluencyAnalyzer
+from .grammar import GrammarCorrector
+from .formality import FormalityTier, DEFAULT_TIER_WHEN_UNTAGGED
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -33,42 +30,20 @@ logger = logging.getLogger(__name__)
 
 class ConfidenceGrammarAnalyzer:
     """
-    Confidence-vs-grammar scoring and feedback for US-21.
-
-    Reuses FluencyAnalyzer output (speech_rate, pause_count,
-    mean_pause_duration, filled_pauses) and GrammarCorrector output
-    (error_density, and optionally error_tags — see analyze() docstring).
-    Does not re-derive any audio/text signal itself.
+    Confidence-vs-grammar scoring and feedback for US-21/BAS-US-11.
     """
 
-    # --- Classification thresholds -----------------------------------
-    # NOT specified anywhere in the PDF spec (US-053 gives no numeric
-    # cutoffs). These are placeholder judgment calls needed to turn a
-    # continuous 0-100 score into the label/tier US-21 requires.
-    # TODO: replace with values from whoever owns scoring calibration,
-    # or make these configurable (e.g. via a settings/config module)
-    # instead of class constants, once one exists.
-    UNINTELLIGIBLE_GRAMMAR_THRESHOLD = 20.0
-    GRAMMAR_THRESHOLD_DEFAULT = 60.0
-    GRAMMAR_THRESHOLD_HIGH_STAKES = 75.0
+    # Grammar-score threshold per formality tier is NOT specified anywhere
+    # in the PDF spec (US-053 gives no numeric cutoffs, and none of the
+    # three-tier values are given either). All fully overridable via the
+    # constructor — nothing here is a fixed/hardcoded requirement.
+    DEFAULT_GRAMMAR_THRESHOLDS = {
+        FormalityTier.CASUAL: 50.0,
+        FormalityTier.PROFESSIONAL: 60.0,
+        FormalityTier.FORMAL_HIGH_STAKES: 75.0,
+    }
 
-    # --- E-03: Repeat Grammatical Offender ----------------------------
-    # PDF wording: "The user makes the exact same tense error 10 times in
-    # a session." Read as >=10 occurrences of the SAME error tag.
-    REPEAT_OFFENDER_THRESHOLD = 10
-
-    # Maps a grammar error tag (as produced by whatever tags
-    # GrammarCorrector/spaCy analysis attaches to a correction) to the
-    # actionable tip surfaced once the threshold is hit. NOT specified
-    # in the PDF beyond the single worked example ("Review Past Tense
-    # Verbs") — this list is a best-effort starting set and should be
-    # extended/confirmed once GrammarCorrector actually emits tags.
-    # TODO(E-03 dependency): grammar.py's correct_text() currently only
-    # returns error_density (a float), not per-error tags. Until
-    # grammar.py is extended to emit something like
-    # spacy_analysis['error_tags'] = ['past_tense', ...], callers must
-    # pass tags in explicitly via the current_error_tags argument below.
-    ERROR_TAG_TIPS = {
+    DEFAULT_ERROR_TAG_TIPS = {
         "past_tense": "Review Past Tense Verbs",
         "subject_verb_agreement": "Review Subject-Verb Agreement",
         "article_usage": "Review Article Usage (a/an/the)",
@@ -76,11 +51,77 @@ class ConfidenceGrammarAnalyzer:
         "plural_form": "Review Plural Noun Forms",
     }
 
+    def __init__(
+        self,
+        fluency_analyzer: Optional[FluencyAnalyzer] = None,
+        grammar_corrector: Optional[GrammarCorrector] = None,
+        unintelligible_grammar_threshold: float = 20.0,
+        grammar_thresholds: Optional[Dict[FormalityTier, float]] = None,
+        repeat_offender_threshold: int = 10,
+        error_tag_tips: Optional[Dict[str, str]] = None,
+    ):
+        """
+        Args:
+            fluency_analyzer: Reuse an existing FluencyAnalyzer instance.
+                Only needed for analyze_from_audio(); lazily constructed
+                if not passed.
+            grammar_corrector: Same, for GrammarCorrector.
+            unintelligible_grammar_threshold: Below this grammar_score,
+                treat input as unintelligible (E-01). Not spec-defined —
+                previous hardcoded value (20.0), now overridable.
+            grammar_thresholds: Maps each FormalityTier to its grammar
+                threshold. Defaults to DEFAULT_GRAMMAR_THRESHOLDS above,
+                fully overridable/extendable.
+            repeat_offender_threshold: Occurrences of the same error tag
+                before E-03's tip fires (spec's own example: 10).
+            error_tag_tips: Maps an error tag to its actionable tip.
+                Defaults to DEFAULT_ERROR_TAG_TIPS, fully overridable.
+        """
+        self.fluency_analyzer = fluency_analyzer
+        self.grammar_corrector = grammar_corrector
+
+        self.unintelligible_grammar_threshold = unintelligible_grammar_threshold
+        self.grammar_thresholds = grammar_thresholds or dict(self.DEFAULT_GRAMMAR_THRESHOLDS)
+        self.repeat_offender_threshold = repeat_offender_threshold
+        self.error_tag_tips = error_tag_tips or dict(self.DEFAULT_ERROR_TAG_TIPS)
+
+    def analyze_from_audio(
+        self,
+        audio: np.ndarray,
+        sample_rate: int,
+        word_timings: List[Dict[str, any]],
+        transcript: str,
+        formality_tier: FormalityTier = DEFAULT_TIER_WHEN_UNTAGGED,
+        error_history: Optional[List[str]] = None,
+        current_error_tags: Optional[List[str]] = None,
+        use_llm: bool = True,
+    ) -> Dict[str, any]:
+        """Audio-input entry point. See analyze() for the scoring logic itself."""
+        if self.fluency_analyzer is None:
+            logger.info("No FluencyAnalyzer provided — constructing one lazily.")
+            self.fluency_analyzer = FluencyAnalyzer()
+        if self.grammar_corrector is None:
+            logger.info("No GrammarCorrector provided — constructing one lazily.")
+            self.grammar_corrector = GrammarCorrector(use_llm=use_llm)
+
+        fluency_details = self.fluency_analyzer.analyze_fluency(
+            audio, sample_rate, word_timings, transcript
+        )
+        grammar_result = self.grammar_corrector.correct_text(transcript, use_llm=use_llm)
+
+        return self.analyze(
+            fluency_details,
+            grammar_result,
+            formality_tier=formality_tier,
+            error_history=error_history,
+            current_error_tags=current_error_tags,
+        )
+
     def analyze(
         self,
         fluency_details: Dict[str, any],
         grammar_result: Dict[str, any],
-        is_high_stakes_context: bool = False,
+        formality_tier: FormalityTier = DEFAULT_TIER_WHEN_UNTAGGED,
         error_history: Optional[List[str]] = None,
         current_error_tags: Optional[List[str]] = None,
     ) -> Dict[str, any]:
@@ -88,55 +129,35 @@ class ConfidenceGrammarAnalyzer:
         Score confidence vs. grammar and produce US-21 feedback.
 
         Args:
-            fluency_details: Output of FluencyAnalyzer.analyze_fluency()
-                (pipeline.py's result['fluency_details']).
-            grammar_result: Output of GrammarCorrector.correct_text()
-                (pipeline.py's result['grammar_errors'] source).
-            is_high_stakes_context: True for formal/professional practice
-                contexts, tightening the grammar threshold (E-02).
-            error_history: Optional list of error tags accumulated so far
-                THIS session (e.g. ["past_tense", "past_tense", ...]).
-                Caller (pipeline.py) is responsible for persisting this
-                list across turns — no DB/session layer exists in this
-                module set, so it must be passed in and the updated list
-                returned each call (see 'error_history' in the result).
-            current_error_tags: Error tag(s) detected in THIS turn's
-                correction, if the caller has them (e.g. from an
-                upstream tagging step). Appended to error_history before
-                repeat-offender detection runs. Safe to omit if no
-                tagging is available yet.
+            fluency_details: Output of FluencyAnalyzer.analyze_fluency().
+            grammar_result: Output of GrammarCorrector.correct_text().
+            formality_tier: FormalityTier (shared with WEC-US-03). Defaults
+                to Professional per that story's own E-01 resolution.
+            error_history: Error tags accumulated so far this session.
+            current_error_tags: Error tag(s) detected this turn.
 
         Returns:
             Dict with confidence_score, grammar_score, primary_metric
-            (always "confidence_score" per US-21 acceptance criteria),
-            grammar_tier, needs_clarification, feedback_hint,
-            repeat_offender_tip (None unless E-03 threshold is hit this
-            call), and error_history (updated, for the caller to persist).
+            (always "confidence_score"), grammar_tier, needs_clarification,
+            feedback_hint, repeat_offender_tip, error_history, formality_tier.
         """
         confidence_score = self._calculate_confidence_score(fluency_details or {})
         error_density = (grammar_result or {}).get("error_density", 0.0)
         grammar_score = round(100.0 * (1.0 - min(1.0, max(0.0, error_density))), 1)
 
-        grammar_threshold = (
-            self.GRAMMAR_THRESHOLD_HIGH_STAKES
-            if is_high_stakes_context
-            else self.GRAMMAR_THRESHOLD_DEFAULT
+        grammar_threshold = self.grammar_thresholds.get(
+            formality_tier, self.DEFAULT_GRAMMAR_THRESHOLDS[FormalityTier.PROFESSIONAL]
         )
 
-        if grammar_score < self.UNINTELLIGIBLE_GRAMMAR_THRESHOLD:
-            # E-01: Unintelligible Grammar — break from confidence-first
-            # model entirely and ask for clarification.
+        if grammar_score < self.unintelligible_grammar_threshold:
             grammar_tier = "unintelligible"
             needs_clarification = True
             feedback_hint = "I didn't quite understand that. Are you trying to say...?"
         else:
             needs_clarification = False
             grammar_tier = "minor_polish" if grammar_score >= grammar_threshold else "needs_attention"
-            feedback_hint = self._build_feedback_hint(grammar_tier, is_high_stakes_context)
+            feedback_hint = self._build_feedback_hint(grammar_tier, formality_tier)
 
-        # E-03: Repeat Grammatical Offender. Runs regardless of tier —
-        # even a "minor_polish" session should surface the tip once the
-        # same tag has repeated enough, per the PDF's exception handling.
         updated_history = list(error_history) if error_history else []
         if current_error_tags:
             updated_history.extend(current_error_tags)
@@ -152,74 +173,33 @@ class ConfidenceGrammarAnalyzer:
             "feedback_hint": feedback_hint,
             "repeat_offender_tip": repeat_offender_tip,
             "error_history": updated_history,
+            "formality_tier": formality_tier,
         }
 
         logger.info(
-            "Confidence/grammar: confidence=%.1f grammar=%.1f tier=%s repeat_tip=%s",
+            "Confidence/grammar: confidence=%.1f grammar=%.1f tier=%s formality=%s",
             confidence_score,
             grammar_score,
             grammar_tier,
-            repeat_offender_tip,
+            formality_tier,
         )
         return result
 
     def _detect_repeat_offender(self, error_history: List[str]) -> Optional[str]:
-        """
-        E-03: Repeat Grammatical Offender.
-
-        If any single error tag has occurred REPEAT_OFFENDER_THRESHOLD or
-        more times in error_history, return one actionable tip for it.
-        Importantly, this NEVER touches confidence_score or grammar_score
-        — per the PDF resolution, the tip is logged in the feedback
-        summary "without tanking the overarching Confidence Score."
-
-        Only the single most frequent qualifying tag is surfaced per call
-        (the PDF's example is singular: "a specific actionable tip"), not
-        one tip per offending tag, to avoid overwhelming the learner.
-
-        Args:
-            error_history: All error tags seen so far this session,
-                including the current turn's tags if any.
-
-        Returns:
-            An actionable tip string, or None if no tag has hit the
-            repeat threshold yet.
-        """
         if not error_history:
             return None
-
         counts = Counter(error_history)
         tag, count = counts.most_common(1)[0]
-
-        if count < self.REPEAT_OFFENDER_THRESHOLD:
+        if count < self.repeat_offender_threshold:
             return None
-
-        tip = self.ERROR_TAG_TIPS.get(tag)
-        if tip is None:
-            # Unknown tag — still surface something rather than silently
-            # dropping a qualifying repeat offender.
-            tip = f"Review {tag.replace('_', ' ').title()}"
-
-        return tip
+        return self.error_tag_tips.get(tag, f"Review {tag.replace('_', ' ').title()}")
 
     def _calculate_confidence_score(self, fluency_details: Dict[str, any]) -> float:
-        """
-        Derive confidence_score (0-100) from audio delivery signals only.
-
-        Reuses the exact point bands FluencyAnalyzer._calculate_overall_score
-        already uses for speech_rate (40 pts), pause frequency (20 pts), and
-        filled_pauses (20 pts) — no new weights invented. FluencyAnalyzer's
-        4th component, lexical_diversity (20 pts), is excluded here per the
-        US-21 design decision: confidence must come from delivery signals,
-        not vocabulary/text richness. The remaining 80-point raw total is
-        rescaled to 0-100.
-        """
+        """Reuses FluencyAnalyzer's own speech_rate/pause/filled_pause point bands (unchanged from prior version)."""
         if not fluency_details:
             return 0.0
 
         raw = 0.0
-
-        # Speech rate (40 pts) — identical bands to fluency.py.
         speech_rate = fluency_details.get("speech_rate", 0.0)
         if 2.0 <= speech_rate <= 4.0:
             raw += 40.0
@@ -228,7 +208,6 @@ class ConfidenceGrammarAnalyzer:
         elif speech_rate > 0:
             raw += 20.0
 
-        # Pause frequency (20 pts) — identical bands to fluency.py.
         pause_count = fluency_details.get("pause_count", 0)
         if pause_count == 0:
             raw += 20.0
@@ -239,7 +218,6 @@ class ConfidenceGrammarAnalyzer:
         else:
             raw += 5.0
 
-        # Filled pauses (20 pts) — identical bands to fluency.py.
         filled_pauses = fluency_details.get("filled_pauses", 0)
         if filled_pauses == 0:
             raw += 20.0
@@ -250,15 +228,12 @@ class ConfidenceGrammarAnalyzer:
         else:
             raw += 5.0
 
-        # Rescale from /80 (three components) to /100.
         return round(min(100.0, max(0.0, raw / 80.0 * 100.0)), 1)
 
-    def _build_feedback_hint(self, grammar_tier: str, is_high_stakes_context: bool) -> str:
-        """Build the confidence-first feedback sentence."""
+    def _build_feedback_hint(self, grammar_tier: str, formality_tier: FormalityTier) -> str:
         if grammar_tier == "minor_polish":
             return "Your message came through clearly. Grammar is solid too — keep it up."
-
         hint = "Your message came through clearly, with a few grammar points as minor polish."
-        if is_high_stakes_context:
-            hint += " In professional writing, tighten these up before sending."
+        if formality_tier == FormalityTier.FORMAL_HIGH_STAKES:
+            hint += " In this high-stakes context, tighten these up before sending."
         return hint
