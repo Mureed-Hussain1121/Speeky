@@ -23,6 +23,7 @@ from middlewares.error_handler import (
     unhandled_exception_handler,
     validation_error_handler,
 )
+from routers.assessment_routes import router as assessment_router
 from routers.auth_routes import router as auth_router
 from routers.user_routes import router as user_router
 from utils.app_error import AppError
@@ -69,6 +70,7 @@ async def health():
 
 app.include_router(auth_router, prefix="/api/auth")
 app.include_router(user_router, prefix="/api/users")
+app.include_router(assessment_router, prefix="/api/assessment")
 
 # Local-folder avatar storage, exposed to frontend as static files
 _uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")

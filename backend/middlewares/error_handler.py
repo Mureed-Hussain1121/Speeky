@@ -22,8 +22,7 @@ async def app_error_handler(
     exc: Exception,
 ) -> JSONResponse:
     exc = cast(AppError, exc)
-    """Port of errorHandler.js for errors raised as AppError (currently just the
-    404 catch-all in main.py, mirroring app.js)."""
+    # Errors raised as AppError (currently just the 404 catch-all in main.py).
 
     print({"message": exc.message, "stack": traceback.format_exc()})
     return JSONResponse(
@@ -33,8 +32,8 @@ async def app_error_handler(
             "message": exc.message,
         },
     )
+
 async def unhandled_exception_handler(_request: Request, exc: Exception) -> JSONResponse:
-    """Port of errorHandler.js for anything NOT an AppError (isOperational=false path)."""
     print({"message": str(exc), "stack": traceback.format_exc()})
     return JSONResponse(
         status_code=500,

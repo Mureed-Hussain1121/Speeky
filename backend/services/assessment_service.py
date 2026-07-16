@@ -1,0 +1,564 @@
+"""
+Initial Communication Assessment + Results Summary.
+
+InMemoryStorage is replaced by BaselineAssessment rows — a row with
+completedAt=None *is* "in progress" (no separate current-assessment state).
+"""
+
+import logging
+import random
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Dict, List, Optional, Tuple
+
+from fastapi import Depends
+from fastapi.responses import JSONResponse
+from prisma import Json
+
+from lib.confidence_engine import ConfidenceScoreEngine, SessionScore
+from lib.prisma_client import db
+from middlewares.auth_middleware import require_auth
+from prisma.enums import AssessmentStatus, LearningLevel
+from prisma.models import BaselineAssessment
+from schemas.assessment_schemas import SubmitResponseSchema
+
+logger = logging.getLogger(__name__)
+
+
+# ── Question bank ────────────────────────────────────────────────────────────
+@dataclass
+class AssessmentQuestion:
+    question_id: str
+    text: str
+    category: str
+
+
+class AssessmentQuestionBank:
+    def __init__(self):
+        self.questions: Dict[str, List[AssessmentQuestion]] = {
+            "introduction": [
+                AssessmentQuestion("intro_1", "Hello! Could you please introduce yourself and tell me what brings you here today?", "introduction"),
+                AssessmentQuestion("intro_2", "What are your main goals for improving your English communication skills?", "introduction"),
+            ],
+            "fluency": [
+                AssessmentQuestion("fluency_1", "Tell me about a typical day in your life, from morning to evening.", "fluency"),
+                AssessmentQuestion("fluency_2", "Describe your favorite hobby or activity and why you enjoy it.", "fluency"),
+            ],
+            "vocabulary": [
+                AssessmentQuestion("vocab_1", "What do you think are the most important qualities for success in your field?", "vocabulary"),
+                AssessmentQuestion("vocab_2", "Describe a challenging situation you faced and how you handled it.", "vocabulary"),
+            ],
+            "pronunciation": [
+                AssessmentQuestion("pron_1", "Please write out this sentence carefully: 'The quick brown fox jumps over the lazy dog.'", "pronunciation"),
+                AssessmentQuestion("pron_2", "Write these words: 'beautiful', 'comfortable', 'extraordinary', 'unfortunately'.", "pronunciation"),
+            ],
+        }
+        self._by_id = {q.question_id: q for qs in self.questions.values() for q in qs}
+
+    def get_assessment_questions(self, count: int = 5) -> List[AssessmentQuestion]:
+        selected = [random.choice(qs) for qs in self.questions.values()]
+        all_questions = [q for qs in self.questions.values() for q in qs]
+        remaining = [q for q in all_questions if q not in selected]
+
+        while len(selected) < count and remaining:
+            q = random.choice(remaining)
+            selected.append(q)
+            remaining.remove(q)
+
+        random.shuffle(selected)
+        return selected[:count]
+
+    def get_by_id(self, question_id: str) -> Optional[AssessmentQuestion]:
+        return self._by_id.get(question_id)
+
+
+# ── Integrity checks  ───────────────────────────
+class AssessmentIntegrityChecker:
+    def check_text_integrity(self, text: str, clipboard_detected: bool = False) -> Tuple[bool, Optional[str]]:
+        if not text or not text.strip():
+            return True, "Empty text response"
+        if clipboard_detected:
+            return True, "Clipboard paste detected"
+
+        words = text.split()
+        if words:
+            avg_length = sum(len(w) for w in words) / len(words)
+            if avg_length < 2:
+                return True, "Suspiciously short words (possible gibberish)"
+
+        if any(char * 5 in text for char in text):
+            return True, "Repetitive character pattern detected"
+
+        return False, None
+
+    def check_response_consistency(self, texts: List[str]) -> Tuple[bool, Optional[str]]:
+        if len(texts) < 2:
+            return False, None
+        if len(set(texts)) == 1:
+            return True, "Identical responses across multiple questions"
+        return False, None
+
+
+_question_bank = AssessmentQuestionBank()
+_integrity_checker = AssessmentIntegrityChecker()
+
+NEXT_STEPS_MAP = {
+    LearningLevel.BEGINNER: [
+        "Start with daily 5-minute practice sessions",
+        "Focus on comfortable, everyday conversation topics",
+        "Use the AI Conversation Practice for low-pressure learning",
+    ],
+    LearningLevel.ELEMENTARY: [
+        "Practice common workplace and daily life scenarios",
+        "Work on expanding your vocabulary range",
+        "Try Scenario-Based Learning for real-world context",
+    ],
+    LearningLevel.INTERMEDIATE: [
+        "Challenge yourself with technical and professional topics",
+        "Focus on refining your fluency and natural flow",
+        "Practice mock interviews for career development",
+    ],
+    LearningLevel.UPPER_INTERMEDIATE: [
+        "Engage with complex topics and abstract discussions",
+        "Work on nuance and sophisticated expression",
+        "Practice advanced scenarios and negotiations",
+    ],
+    LearningLevel.ADVANCED: [
+        "Focus on specialized vocabulary for your field",
+        "Practice high-stakes communication scenarios",
+        "Work on subtle aspects of tone and style",
+    ],
+    LearningLevel.PROFICIENT: [
+        "Maintain and refine your advanced skills",
+        "Practice complex, multi-participant discussions",
+        "Focus on communication leadership and mentoring",
+    ],
+}
+
+_LEVEL_LABELS = {
+    LearningLevel.BEGINNER: "Foundational",
+    LearningLevel.ELEMENTARY: "Developing",
+    LearningLevel.INTERMEDIATE: "Progressing",
+    LearningLevel.UPPER_INTERMEDIATE: "Advanced",
+    LearningLevel.ADVANCED: "Proficient",
+    LearningLevel.PROFICIENT: "Expert",
+}
+
+
+def _level_label(level: LearningLevel) -> str:
+    return _LEVEL_LABELS.get(level, "Developing")
+
+
+def _level_rank(level: LearningLevel) -> int:
+    return list(LearningLevel).index(level)
+
+
+def _estimate_vocabulary_score(text: str) -> float:
+    if not text:
+        return 0.0
+    words = text.split()
+    if not words:
+        return 0.0
+
+    unique_words = len(set(w.lower() for w in words))
+    total_words = len(words)
+    lexical_diversity = unique_words / total_words
+    avg_word_length = sum(len(w) for w in words) / total_words
+
+    return round((lexical_diversity * 50) + (min(avg_word_length / 8, 1) * 50), 2)
+
+
+def _determine_learning_level(confidence_score: float) -> LearningLevel:
+    if confidence_score >= 90:
+        return LearningLevel.PROFICIENT
+    elif confidence_score >= 80:
+        return LearningLevel.ADVANCED
+    elif confidence_score >= 70:
+        return LearningLevel.UPPER_INTERMEDIATE
+    elif confidence_score >= 60:
+        return LearningLevel.INTERMEDIATE
+    elif confidence_score >= 40:
+        return LearningLevel.ELEMENTARY
+    else:
+        return LearningLevel.BEGINNER
+
+
+async def _score_confidence(user_id: str, new_session: SessionScore) -> float:
+    """Reconstruct the engine from completed history + this new session (stateless per request)."""
+    engine = ConfidenceScoreEngine()
+    prior = await db.baselineassessment.find_many(
+        where={"userId": user_id, "completedAt": {"not": None}},
+        order={"completedAt": "asc"},
+    )
+    for row in prior:
+        engine.add_session_score(
+            SessionScore(
+                timestamp=row.completedAt,
+                fluency_score=row.fluencyScore or 0.0,
+                vocabulary_score=row.vocabularyScore or 0.0,
+                pronunciation_score=row.pronunciationScore,
+                is_text_only=row.pronunciationScore is None,
+                is_complete=True,
+            )
+        )
+    engine.add_session_score(new_session)
+    return engine.get_confidence_score()
+
+
+# ── Controllers ───────────────────────────────────────────────────────────────
+async def start_assessment(user_id: str = Depends(require_auth)):
+    questions = _question_bank.get_assessment_questions(count=5)
+
+    assessment = await db.baselineassessment.create(
+        data={"userId": user_id, "questionIds": [q.question_id for q in questions]}
+    )
+    await db.user.update(where={"id": user_id}, data={"assessmentStatus": AssessmentStatus.IN_PROGRESS})
+
+    return {
+        "assessment_id": assessment.id,
+        "total_questions": len(questions),
+        "current_question": questions[0].text,
+        "question_index": 0,
+        "estimated_duration_minutes": 5,
+    }
+
+
+async def submit_response(
+    assessment_id: str, payload: SubmitResponseSchema, user_id: str = Depends(require_auth)
+):
+    assessment = await db.baselineassessment.find_unique(where={"id": assessment_id})
+    if not assessment or assessment.userId != user_id:
+        return JSONResponse(status_code=404, content={"error": "Assessment not found"})
+    if assessment.completedAt:
+        return JSONResponse(status_code=400, content={"error": "Assessment already completed"})
+
+    question_id = assessment.questionIds[assessment.currentIndex]
+    question = _question_bank.get_by_id(question_id)
+
+    is_flagged, flag_reason = _integrity_checker.check_text_integrity(
+        payload.text_data, payload.clipboard_detected
+    )
+
+    if is_flagged:
+        processing_result = {
+            "question_id": question_id,
+            "category": question.category if question else None,
+            "is_flagged": True,
+            "flag_reason": flag_reason,
+            "processing_success": False,
+        }
+    else:
+        processing_result = {
+            "question_id": question_id,
+            "category": question.category if question else None,
+            "is_flagged": False,
+            "flag_reason": None,
+            "transcription": payload.text_data,
+            "fluency_score": 0,
+            "pronunciation_score": None,
+            "vocabulary_score": _estimate_vocabulary_score(payload.text_data),
+            "processing_success": True,
+        }
+
+    responses = list(assessment.responses) + [processing_result]
+    new_index = assessment.currentIndex + 1
+
+    updated = await db.baselineassessment.update(
+        where={"id": assessment_id},
+        data={"responses": Json(responses), "currentIndex": new_index},
+    )
+
+    if new_index >= len(assessment.questionIds):
+        return await _complete_assessment(updated)
+
+    next_question = _question_bank.get_by_id(assessment.questionIds[new_index])
+    return {
+        "status": "in_progress",
+        "next_question": next_question.text if next_question else None,
+        "question_index": new_index,
+        "previous_result": processing_result,
+    }
+
+
+async def _complete_assessment(assessment: BaselineAssessment) -> Dict:
+    responses = assessment.responses
+    successful = [r for r in responses if r.get("processing_success")]
+
+    vocabulary_scores = [r["vocabulary_score"] for r in successful]
+    avg_vocabulary = round(sum(vocabulary_scores) / len(vocabulary_scores), 2) if vocabulary_scores else 0.0
+    # Text-only responses carry no audio signal, so fluency/pronunciation stay
+    # unscored here (see ScoringWeights normalization in confidence_engine.py).
+    avg_fluency = 0.0
+    avg_pronunciation = None
+
+    is_flagged, flag_reason = _integrity_checker.check_response_consistency(
+        [r["transcription"] for r in successful if r.get("transcription")]
+    )
+    if not is_flagged:
+        flagged_responses = [r for r in responses if r.get("is_flagged")]
+        is_flagged = len(flagged_responses) > len(responses) / 2
+        flag_reason = flagged_responses[0].get("flag_reason") if flagged_responses else None
+
+    confidence_score = await _score_confidence(
+        assessment.userId,
+        SessionScore(
+            timestamp=datetime.now(timezone.utc),
+            fluency_score=avg_fluency,
+            vocabulary_score=avg_vocabulary,
+            pronunciation_score=avg_pronunciation,
+            is_text_only=True,
+            is_complete=True,
+        ),
+    )
+    learning_level = _determine_learning_level(confidence_score)
+    completed_at = datetime.now(timezone.utc)
+
+    updated = await db.baselineassessment.update(
+        where={"id": assessment.id},
+        data={
+            "completedAt": completed_at,
+            "fluencyScore": avg_fluency,
+            "vocabularyScore": avg_vocabulary,
+            "pronunciationScore": avg_pronunciation,
+            "confidenceScore": confidence_score,
+            "learningLevel": learning_level,
+            "isFlagged": is_flagged,
+            "flagReason": flag_reason,
+        },
+    )
+    await db.user.update(
+        where={"id": assessment.userId},
+        data={"assessmentStatus": AssessmentStatus.COMPLETED, "learningLevel": learning_level},
+    )
+
+    # regression check — only meaningful once a prior completed
+    # assessment exists. Local import breaks the assessment/reassessment
+    # service import cycle (reassessment_service reuses start_assessment).
+    from services import reassessment_service
+
+    regression = None
+    prior_count = await db.baselineassessment.count(
+        where={"userId": assessment.userId, "completedAt": {"not": None}, "id": {"not": assessment.id}}
+    )
+    if prior_count > 0:
+        regression_data = await reassessment_service.detect_score_regression(
+            assessment.userId, confidence_score, exclude_assessment_id=assessment.id
+        )
+        regression = reassessment_service.handle_regression_flag(regression_data)
+
+    return {
+        "status": "completed",
+        "assessment_id": updated.id,
+        "confidence_score": confidence_score,
+        "fluency_score": avg_fluency,
+        "vocabulary_score": avg_vocabulary,
+        "pronunciation_score": avg_pronunciation,
+        "learning_level": learning_level.value,
+        "duration_seconds": (completed_at - assessment.startedAt).total_seconds(),
+        "is_flagged": is_flagged,
+        "flag_reason": flag_reason,
+        "regression": regression,
+    }
+
+
+async def get_assessment_status(assessment_id: str, user_id: str = Depends(require_auth)):
+    assessment = await db.baselineassessment.find_unique(where={"id": assessment_id})
+    if not assessment or assessment.userId != user_id:
+        return JSONResponse(status_code=404, content={"error": "Assessment not found"})
+
+    if assessment.completedAt:
+        return {
+            "status": "completed",
+            "confidence_score": assessment.confidenceScore,
+            "learning_level": assessment.learningLevel,
+        }
+
+    elapsed = (datetime.now(timezone.utc) - assessment.startedAt).total_seconds()
+    return {
+        "status": "in_progress",
+        "current_question_index": assessment.currentIndex,
+        "total_questions": len(assessment.questionIds),
+        "elapsed_seconds": elapsed,
+    }
+
+
+def _encouraging_message(confidence_score: float, learning_level: LearningLevel) -> str:
+    if confidence_score >= 80:
+        messages = [
+            "Excellent start! You have strong communication foundations to build upon.",
+            "Great job! Your confidence is high - let's maintain this momentum.",
+            "Wonderful! You're showing advanced communication skills already.",
+        ]
+    elif confidence_score >= 60:
+        messages = [
+            "Good start! You have solid fundamentals with room to grow.",
+            "Well done! Your communication skills are developing nicely.",
+            "Nice work! You're on a great path to improvement.",
+        ]
+    elif confidence_score >= 40:
+        messages = [
+            "Welcome! This is your starting point - every expert was once a beginner.",
+            "Great first step! You've begun your journey to better communication.",
+            "Perfect place to start! Let's build your confidence together.",
+        ]
+    else:
+        messages = [
+            "Welcome! This assessment helps us understand where to begin your journey.",
+            "Great that you're here! Let's work together to build your confidence.",
+            "Starting point established! Every improvement journey begins somewhere.",
+        ]
+    # learning_level is whatever Prisma handed back for the enum column
+    # (a plain str, not a coerced LearningLevel instance) — hash() works on
+    # either, so no .value access needed here.
+    return messages[hash(learning_level) % len(messages)]
+
+
+def _skill_description(skill: str, score: float) -> str:
+    descriptions = {
+        "fluency": {
+            "high": "You speak with natural flow and good pacing.",
+            "medium": "You show developing flow in your speech patterns.",
+            "developing": "Building your natural speaking rhythm.",
+        },
+        "vocabulary": {
+            "high": "You use varied and appropriate vocabulary effectively.",
+            "medium": "You have a good foundation with room to expand.",
+            "developing": "Building your word choice variety.",
+        },
+        "pronunciation": {
+            "high": "Your pronunciation is clear and accurate.",
+            "medium": "Your pronunciation is generally clear with some areas to refine.",
+            "developing": "Working on clarity and accuracy in pronunciation.",
+        },
+    }
+    tier = "high" if score >= 70 else "medium" if score >= 50 else "developing"
+    return descriptions[skill][tier]
+
+
+def _skill_strength(score: float) -> str:
+    if score >= 70:
+        return "strong"
+    elif score >= 50:
+        return "developing"
+    else:
+        return "emerging"
+
+
+def _skill_breakdown(assessment: BaselineAssessment) -> Dict:
+    breakdown = {
+        "fluency": {
+            "score": assessment.fluencyScore,
+            "display": f"{assessment.fluencyScore:.1f}/100",
+            "label": "Fluency",
+            "description": _skill_description("fluency", assessment.fluencyScore),
+            "strength": _skill_strength(assessment.fluencyScore),
+        },
+        "vocabulary": {
+            "score": assessment.vocabularyScore,
+            "display": f"{assessment.vocabularyScore:.1f}/100",
+            "label": "Vocabulary",
+            "description": _skill_description("vocabulary", assessment.vocabularyScore),
+            "strength": _skill_strength(assessment.vocabularyScore),
+        },
+    }
+    if assessment.pronunciationScore is not None:
+        breakdown["pronunciation"] = {
+            "score": assessment.pronunciationScore,
+            "display": f"{assessment.pronunciationScore:.1f}/100",
+            "label": "Pronunciation",
+            "description": _skill_description("pronunciation", assessment.pronunciationScore),
+            "strength": _skill_strength(assessment.pronunciationScore),
+        }
+    return breakdown
+
+
+def _positive_highlight(assessment: BaselineAssessment) -> str:
+    highlights = []
+    if assessment.fluencyScore >= 70:
+        highlights.append("strong natural speaking flow")
+    if assessment.vocabularyScore >= 70:
+        highlights.append("good vocabulary range")
+    if assessment.pronunciationScore and assessment.pronunciationScore >= 70:
+        highlights.append("clear pronunciation")
+
+    if highlights:
+        return f"You show {', '.join(highlights)} - great foundation to build on!"
+    return "You've taken the first step - consistency will lead to improvement."
+
+
+def _positive_framing(assessment: BaselineAssessment) -> Dict:
+    return {
+        "title": "Your Communication Journey Starts Here",
+        "subtitle": f"Starting Level: {_level_label(assessment.learningLevel)}",
+        "message": (
+            f"This isn't a grade - it's your personalized starting point. "
+            f"Your confidence score of {assessment.confidenceScore:.1f} shows where you are now, "
+            f"and every practice session will help you improve from here."
+        ),
+        "highlight": _positive_highlight(assessment),
+    }
+
+
+async def get_results_summary(assessment_id: str, user_id: str = Depends(require_auth)):
+    assessment = await db.baselineassessment.find_unique(where={"id": assessment_id})
+    if not assessment or assessment.userId != user_id:
+        return JSONResponse(status_code=404, content={"error": "Assessment not found"})
+    if not assessment.completedAt:
+        return JSONResponse(status_code=400, content={"error": "Assessment not completed"})
+
+    user = await db.user.find_unique(where={"id": user_id})
+
+    return {
+        "assessment_id": assessment.id,
+        "user_id": user_id,
+        "display_name": user.name or user.email,
+        "completed_at": assessment.completedAt.isoformat(),
+        "learning_level": {
+            "level": assessment.learningLevel,
+            "label": _level_label(assessment.learningLevel),
+        },
+        "confidence_score": {
+            "score": assessment.confidenceScore,
+            "display": f"{assessment.confidenceScore:.1f}/100",
+            "message": _encouraging_message(assessment.confidenceScore, assessment.learningLevel),
+        },
+        "skill_breakdown": _skill_breakdown(assessment),
+        "positive_framing": _positive_framing(assessment),
+        "next_steps": NEXT_STEPS_MAP.get(assessment.learningLevel, NEXT_STEPS_MAP[LearningLevel.BEGINNER]),
+        "is_flagged": assessment.isFlagged,
+        "flag_reason": assessment.flagReason,
+    }
+
+
+async def get_progress_comparison(user_id: str = Depends(require_auth)):
+    assessments = await db.baselineassessment.find_many(
+        where={"userId": user_id, "completedAt": {"not": None}},
+        order={"completedAt": "asc"},
+    )
+    if len(assessments) < 2:
+        return {"message": "Not enough data to compare", "has_comparison": False}
+
+    first, latest = assessments[0], assessments[-1]
+
+    def _delta(change: float) -> Dict:
+        return {
+            "change": change,
+            "display": f"+{change:.1f}" if change > 0 else f"{change:.1f}",
+            "positive": change > 0,
+        }
+
+    return {
+        "has_comparison": True,
+        "days_between": (latest.completedAt - first.completedAt).days,
+        "assessment_count": len(assessments),
+        "improvements": {
+            "confidence": _delta(latest.confidenceScore - first.confidenceScore),
+            "fluency": _delta(latest.fluencyScore - first.fluencyScore),
+            "vocabulary": _delta(latest.vocabularyScore - first.vocabularyScore),
+        },
+        "level_progression": {
+            "from": _level_label(first.learningLevel),
+            "to": _level_label(latest.learningLevel),
+            "improved": _level_rank(latest.learningLevel) > _level_rank(first.learningLevel),
+        },
+    }

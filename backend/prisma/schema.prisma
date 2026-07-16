@@ -13,19 +13,88 @@ enum Role {
   ADMIN
 }
 
+enum AssessmentStatus {
+  UNASSESSED
+  IN_PROGRESS
+  COMPLETED
+  PLATEAUED
+}
+
+enum LearningLevel {
+  BEGINNER
+  ELEMENTARY
+  INTERMEDIATE
+  UPPER_INTERMEDIATE
+  ADVANCED
+  PROFICIENT
+}
+
+enum PromptKind {
+  SKIP_ASSESSMENT
+  REASSESSMENT
+}
+
 model User {
-  id                  String               @id @default(cuid())
-  email               String               @unique
-  password            String
-  name                String?
-  avatarUrl           String               @default("user.webp")
-  role                Role                 @default(USER)
-  createdAt           DateTime             @default(now())
-  updatedAt           DateTime             @updatedAt
-  passwordResetTokens PasswordResetToken[]
-  refreshTokens       RefreshToken[]
+  id                   String                 @id @default(cuid())
+  email                String                 @unique
+  password             String
+  name                 String?
+  avatarUrl            String                 @default("user.webp")
+  role                 Role                   @default(USER)
+  assessmentStatus     AssessmentStatus       @default(UNASSESSED)
+  learningLevel        LearningLevel?
+  createdAt            DateTime               @default(now())
+  updatedAt            DateTime               @updatedAt
+  passwordResetTokens  PasswordResetToken[]
+  refreshTokens        RefreshToken[]
+  baselineAssessments  BaselineAssessment[]
+  reassessmentRequests ReassessmentRequest[]
+  promptLogs           PromptLog[]
 
   @@map("users")
+}
+
+model BaselineAssessment {
+  id                 String         @id @default(cuid())
+  userId             String
+  user               User           @relation(fields: [userId], references: [id], onDelete: Cascade)
+  questionIds        String[]
+  currentIndex       Int            @default(0)
+  responses          Json           @default("[]")
+  fluencyScore       Float?
+  vocabularyScore    Float?
+  pronunciationScore Float?
+  confidenceScore    Float?
+  learningLevel      LearningLevel?
+  isFlagged          Boolean        @default(false)
+  flagReason         String?
+  startedAt          DateTime       @default(now())
+  completedAt        DateTime?
+
+  @@map("baseline_assessments")
+}
+
+model ReassessmentRequest {
+  id            String    @id @default(cuid())
+  userId        String
+  user          User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  requestedAt   DateTime  @default(now())
+  scheduledDate DateTime?
+  completed     Boolean   @default(false)
+  isEarlyRetake Boolean   @default(false)
+  cycleCount    Int       @default(0)
+
+  @@map("reassessment_requests")
+}
+
+model PromptLog {
+  id        String     @id @default(cuid())
+  userId    String
+  user      User       @relation(fields: [userId], references: [id], onDelete: Cascade)
+  kind      PromptKind
+  createdAt DateTime   @default(now())
+
+  @@map("prompt_logs")
 }
 
 model RefreshToken {

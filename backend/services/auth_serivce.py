@@ -22,12 +22,8 @@ from utils.jwt_utils import (
     verify_reset_token,
 )
 
-# Constant-time dummy hash for login timing-attack prevention (see login()).
-# ponytail: the JS source hardcodes its own dummy string, but that exact string
-# isn't a structurally valid bcrypt hash for python's `bcrypt` package (raises
-# "Invalid salt" instead of just failing the comparison). Generated a real one
-# with the same cost factor (12) so the security property — constant-time
-# comparison whether or not the user exists — is preserved instead of crashing.
+# Constant-time dummy hash for login timing-attack prevention.
+# Generated a real one with the same cost factor (12) so the security property — constant-time
 _DUMMY_HASH = b"$2b$12$Oz3oZryYML3JJdklScxs9.ngNgsByHP1HsIhF8M/JFNtX1rHt2JWO"
 
 BCRYPT_COST = 12
