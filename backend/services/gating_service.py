@@ -33,6 +33,7 @@ class GatedFeature(str, Enum):
     AI_CONVERSATION_PRACTICE = "ai_conversation_practice"
     INTERVIEW_COACH = "interview_coach"
     SCENARIO_BASED_LEARNING = "scenario_based_learning"
+    WORKPLACE_ENGLISH_COACH = "workplace_english_coach"
     PROGRESS_DASHBOARD = "progress_dashboard"
     LEARNING_PATHS = "learning_paths"
     DAILY_CHALLENGES = "daily_challenges"
@@ -50,6 +51,7 @@ GATED_FEATURE_LABELS = {
     GatedFeature.AI_CONVERSATION_PRACTICE: "AI Conversation Practice",
     GatedFeature.INTERVIEW_COACH: "Interview Coach",
     GatedFeature.SCENARIO_BASED_LEARNING: "Scenario-Based Learning",
+    GatedFeature.WORKPLACE_ENGLISH_COACH: "Workplace English Coach",
     GatedFeature.PROGRESS_DASHBOARD: "Progress Dashboard",
     GatedFeature.LEARNING_PATHS: "Learning Paths",
     GatedFeature.DAILY_CHALLENGES: "Daily Challenges",

@@ -34,6 +34,27 @@ enum PromptKind {
   REASSESSMENT
 }
 
+// Workplace English Coach scenarios (WEC-US-08 .. WEC-US-12). Keys mirror
+// lib/prompts.WORKPLACE_SCENARIOS.
+enum CoachingScenario {
+  EMAIL_WRITING          // WEC-US-09 (text)
+  CLIENT_COMMUNICATION   // WEC-US-10 (audio roleplay)
+  MEETING_COMMUNICATION  // WEC-US-11 (audio roleplay)
+  PRESENTATION_PREP      // WEC-US-12 (audio)
+  GENERAL_WORKPLACE      // WEC-US-08 (text or audio)
+}
+
+enum CoachingInputMode {
+  TEXT
+  AUDIO
+}
+
+enum CoachingStatus {
+  IN_PROGRESS
+  COMPLETED
+  ENDED_EARLY   // e.g. WEC-US-10 E-01 de-escalation cut-off
+}
+
 model User {
   id                   String                @id @default(cuid())
   email                String                @unique
@@ -50,8 +71,44 @@ model User {
   baselineAssessments  BaselineAssessment[]
   reassessmentRequests ReassessmentRequest[]
   promptLogs           PromptLog[]
+  coachingSessions     CoachingSession[]
 
   @@map("users")
+}
+
+// Workplace English Coach session (WEC-US-08 .. WEC-US-12). One row per practice
+// attempt. A row with completedAt=None is in progress (roleplay scenarios may span
+// several turns held in `turns`). Scores are confidence-first: professionalTone is the
+// headline metric, independent of grammar.
+model CoachingSession {
+  id                 String            @id @default(cuid())
+  userId             String
+  user               User              @relation(fields: [userId], references: [id], onDelete: Cascade)
+  scenario           CoachingScenario
+  inputMode          CoachingInputMode
+  status             CoachingStatus    @default(IN_PROGRESS)
+  promptText         String                                     // scenario brief shown to user
+  submission         String?                                    // final text / transcript graded
+  turns              Json              @default("[]")            // roleplay dialogue [{role,content}]
+  audioFeatures      Json?                                      // AUDIO pipeline signal snapshot
+
+  // Scores (0-100). pronunciationScore stays null for the TEXT pipeline.
+  professionalTone   Float?
+  clarityScore       Float?
+  effectivenessScore Float?
+  fluencyScore       Float?
+  vocabularyScore    Float?
+  pronunciationScore Float?
+  confidenceScore    Float?
+
+  feedback           Json?                                      // grader summary + polished version
+  flags              Json              @default("[]")           // exception-handling flags raised
+  metObjective       Boolean?
+  createdAt          DateTime          @default(now())
+  completedAt        DateTime?
+
+  @@index([userId])
+  @@map("coaching_sessions")
 }
 
 model BaselineAssessment {

@@ -30,7 +30,13 @@ prisma-migrate = "prisma migrate dev"
 prisma-pull = "prisma db pull"
 prisma-studio = "prisma studio"
 
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
+
 [dependency-groups]
 dev = [
     "taskipy>=1.14.1",
+    "pytest>=8.0",
+    "pytest-asyncio>=0.24",
 ]
