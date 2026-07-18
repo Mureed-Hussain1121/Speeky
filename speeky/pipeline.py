@@ -12,6 +12,11 @@ from typing import Dict, Optional, List
 import os
 from datetime import datetime
 
+# Light, dependency-free imports load unconditionally (needed by process()).
+from .formality import FormalityTier
+
+# Heavy/optional components (ML deps) degrade to None so the pipeline still imports
+# for standalone testing; _load_all_components / _ensure_component guard on truthiness.
 try:
     from .vad import VoiceActivityDetector
     from .asr import AutomaticSpeechRecognition
@@ -22,6 +27,11 @@ try:
     from .response import ConversationEngine
     from .tts import TextToSpeech
     from .confidence import ConfidenceScoreEngine, SessionScore, ConfidenceGrammarAnalyzer
+    from .code_switch_text import TextCodeSwitchDetector
+    from .code_switch_tolerance import CodeSwitchToleranceWrapper
+    from .cultural_terms import CulturalTermClassifier
+    from .retry_drill import RetryDrillService
+    from .word_mastery import WordMasteryTracker
 except ImportError:
     # For standalone testing
     try:
@@ -34,6 +44,11 @@ except ImportError:
         from response import ConversationEngine
         from tts import TextToSpeech
         from confidence import ConfidenceScoreEngine, SessionScore, ConfidenceGrammarAnalyzer
+        from code_switch_text import TextCodeSwitchDetector
+        from code_switch_tolerance import CodeSwitchToleranceWrapper
+        from cultural_terms import CulturalTermClassifier
+        from retry_drill import RetryDrillService
+        from word_mastery import WordMasteryTracker
     except ImportError:
         # If dependencies not available, create dummy classes for testing
         VoiceActivityDetector = None
@@ -44,6 +59,11 @@ except ImportError:
         FluencyAnalyzer = None
         ConversationEngine = None
         TextToSpeech = None
+        TextCodeSwitchDetector = None
+        CodeSwitchToleranceWrapper = None
+        CulturalTermClassifier = None
+        RetryDrillService = None
+        WordMasteryTracker = None
         try:
             from .confidence import ConfidenceScoreEngine, SessionScore, ConfidenceGrammarAnalyzer
         except ImportError:
@@ -64,11 +84,11 @@ HIGH_STAKES_CONTEXT_TYPES = {"hr", "technical", "functional"}
 class SpeekyPipeline:
     """
     Main pipeline orchestrator for Speeky language practice system.
-    
+
     This class coordinates all modules to provide comprehensive
     speech analysis and feedback for English language practice.
     """
-    
+
     def __init__(
         self,
         asr_model_size: str = "distil-large-v3",
@@ -80,7 +100,7 @@ class SpeekyPipeline:
     ):
         """
         Initialize the Speeky pipeline.
-        
+
         Args:
             asr_model_size: Size of ASR model
             tts_voice: TTS voice to use
@@ -94,7 +114,7 @@ class SpeekyPipeline:
         self.use_llm = use_llm
         self.ollama_url = ollama_url
         self.lazy_loading = lazy_loading
-        
+
         # Components (loaded lazily if enabled)
         self.vad = None
         self.asr = None
@@ -105,67 +125,76 @@ class SpeekyPipeline:
         self.conversation_engine = None
         self.tts = None
         self.confidence_analyzer = None
-        
-        # Confidence score engine
+
+        # Confidence score engine (aggregate top-line score; fed by callers such as
+        # the assessment flow, not by process()). Kept so the confidence_engine ctor
+        # arg used by web_app.py stays wired.
         self.confidence_engine = confidence_engine or ConfidenceScoreEngine()
-        
+
+        # Code-Switch Coaching components (US-56/57/58)
+        self.code_switch_detector = None
+        self.tolerance_wrapper = None
+        self.cultural_classifier = None
+        self.retry_drill = None
+        self.mastery_tracker = None
+
         # Load components if not lazy loading
         if not lazy_loading:
             self._load_all_components()
-    
+
     def _load_all_components(self):
         """Load all pipeline components."""
         logger.info("Loading all pipeline components...")
-        
+
         if VoiceActivityDetector:
             try:
                 self.vad = VoiceActivityDetector()
                 logger.info("VAD loaded")
             except Exception as e:
                 logger.error(f"Failed to load VAD: {e}")
-        
+
         if AutomaticSpeechRecognition:
             try:
                 self.asr = AutomaticSpeechRecognition(model_size=self.asr_model_size)
                 logger.info("ASR loaded")
             except Exception as e:
                 logger.error(f"Failed to load ASR: {e}")
-        
+
         if WordAligner:
             try:
                 self.aligner = WordAligner()
                 logger.info("Word aligner loaded")
             except Exception as e:
                 logger.error(f"Failed to load aligner: {e}")
-        
+
         if PronunciationScorer:
             try:
                 self.pronunciation_scorer = PronunciationScorer()
                 logger.info("Pronunciation scorer loaded")
             except Exception as e:
                 logger.error(f"Failed to load pronunciation scorer: {e}")
-        
+
         if GrammarCorrector:
             try:
                 self.grammar_corrector = GrammarCorrector(use_llm=self.use_llm, ollama_url=self.ollama_url)
                 logger.info("Grammar corrector loaded")
             except Exception as e:
                 logger.error(f"Failed to load grammar corrector: {e}")
-        
+
         if FluencyAnalyzer:
             try:
                 self.fluency_analyzer = FluencyAnalyzer()
                 logger.info("Fluency analyzer loaded")
             except Exception as e:
                 logger.error(f"Failed to load fluency analyzer: {e}")
-        
+
         if ConversationEngine:
             try:
                 self.conversation_engine = ConversationEngine(ollama_url=self.ollama_url)
                 logger.info("Conversation engine loaded")
             except Exception as e:
                 logger.error(f"Failed to load conversation engine: {e}")
-        
+
         try:
             self.tts = TextToSpeech(voice=self.tts_voice)
             logger.info("TTS loaded")
@@ -177,9 +206,21 @@ class SpeekyPipeline:
             logger.info("Confidence/grammar analyzer loaded")
         except Exception as e:
             logger.error(f"Failed to load confidence/grammar analyzer: {e}")
-        
+
+        try:
+            self.code_switch_detector = TextCodeSwitchDetector(
+                nlp=self.grammar_corrector.nlp if self.grammar_corrector else None
+            )
+            self.tolerance_wrapper = CodeSwitchToleranceWrapper(detector=self.code_switch_detector)
+            self.cultural_classifier = CulturalTermClassifier()
+            self.retry_drill = RetryDrillService()
+            self.mastery_tracker = WordMasteryTracker()
+            logger.info("Code-switch coaching components loaded")
+        except Exception as e:
+            logger.error(f"Failed to load code-switch coaching components: {e}")
+
         logger.info("All components loaded")
-    
+
     def _ensure_component(self, component_name: str):
         """Ensure a component is loaded (for lazy loading)."""
         if self.lazy_loading:
@@ -201,33 +242,49 @@ class SpeekyPipeline:
                 self.tts = TextToSpeech(voice=self.tts_voice)
             elif component_name == "confidence" and self.confidence_analyzer is None:
                 self.confidence_analyzer = ConfidenceGrammarAnalyzer()
-    
+            elif component_name == "code_switch" and self.tolerance_wrapper is None:
+                self.code_switch_detector = TextCodeSwitchDetector(
+                    nlp=self.grammar_corrector.nlp if self.grammar_corrector else None
+                )
+                self.tolerance_wrapper = CodeSwitchToleranceWrapper(detector=self.code_switch_detector)
+                self.cultural_classifier = CulturalTermClassifier()
+                self.retry_drill = RetryDrillService()
+                self.mastery_tracker = WordMasteryTracker()
+
     def process(
         self,
         audio_input: np.ndarray,
         sample_rate: int,
         context_type: str = "general",
         skip_vad: bool = False,
-        output_dir: str = "output"
+        output_dir: str = "output",
+        learner_id: str = "anonymous",
+        is_timed_assessment: bool = False,
     ) -> Dict:
         """
         Process audio input through the complete pipeline.
-        
+
         Args:
             audio_input: Audio data as numpy array
             sample_rate: Sample rate of the audio
             context_type: Context type for conversation (hr, technical, functional, general)
             skip_vad: Whether to skip VAD (useful for pre-segmented audio)
             output_dir: Directory to save output files
-            
+            learner_id: Learner identifier, used for code-switch coaching
+                personalization (US-56/57/58). Defaults to "anonymous" for
+                backward compatibility with existing callers.
+            is_timed_assessment: True if this is a scored, time-boxed
+                exercise (WEC-US-05 E-05) — suppresses the interactive
+                retry prompt during timing-sensitive segments.
+
         Returns:
             Dictionary with complete analysis results
         """
         logger.info("Starting pipeline processing...")
-        
+
         # Create output directory if needed
         os.makedirs(output_dir, exist_ok=True)
-        
+
         # Initialize result dictionary
         result = {
             'timestamp': datetime.now().isoformat(),
@@ -241,9 +298,12 @@ class SpeekyPipeline:
             'response_text': '',
             'audio_filename': '',
             'confidence_analysis': {},
+            'code_switch_flags': [],
+            'retry_prompt': None,
+            'mastery_newly_mastered': [],
             'errors': []
         }
-        
+
         try:
             logger.info("Starting pipeline processing...")
             
@@ -280,7 +340,7 @@ class SpeekyPipeline:
                             logger.warning("No speech segments detected, using original audio")
                     else:
                         logger.warning("No speech detected, using original audio")
-            
+
             # Step 2: ASR
             self._ensure_component("asr")
             if self.asr:
@@ -292,11 +352,11 @@ class SpeekyPipeline:
                 logger.error("ASR not available")
                 result['errors'].append("ASR component not available")
                 return result
-            
+
             if not result['original_text']:
                 logger.warning("Empty transcription, skipping further analysis")
                 return result
-            
+
             # Step 3: Word alignment
             self._ensure_component("aligner")
             if self.aligner:
@@ -305,7 +365,7 @@ class SpeekyPipeline:
                 )
             else:
                 word_alignments = word_timings
-            
+
             # Step 4: Pronunciation scoring
             self._ensure_component("pronunciation")
             if self.pronunciation_scorer:
@@ -316,7 +376,7 @@ class SpeekyPipeline:
                 result['pronunciation_details'] = pronunciation_result
             else:
                 result['errors'].append("Pronunciation scorer not available")
-            
+
             # Step 5: Fluency analysis
             self._ensure_component("fluency")
             if self.fluency_analyzer:
@@ -327,44 +387,8 @@ class SpeekyPipeline:
                 result['fluency_details'] = fluency_result
             else:
                 result['errors'].append("Fluency analyzer not available")
-                result['fluency_score'] = 0.0
-            
-            # Step 5.5: Vocabulary score estimation
-            vocabulary_score = self._estimate_vocabulary_score(result['original_text'])
-            result['vocabulary_score'] = vocabulary_score
-            
-            # Step 5.6: Confidence score calculation
-            try:
-                # Create session score for confidence calculation
-                session_score = SessionScore(
-                    timestamp=datetime.now(),
-                    fluency_score=result.get('fluency_score', 0.0),
-                    vocabulary_score=vocabulary_score,
-                    pronunciation_score=result.get('pronunciation_score'),
-                    is_text_only=False,
-                    is_complete=True
-                )
-                
-                # Add to confidence engine
-                self.confidence_engine.add_session_score(session_score)
-                
-                # Get current confidence score
-                result['confidence_score'] = self.confidence_engine.get_confidence_score()
-                result['confidence_breakdown'] = self.confidence_engine.get_confidence_breakdown()
-                
-            except Exception as e:
-                logger.error(f"Error calculating confidence score: {e}")
-                result['confidence_score'] = 0.0
-                result['errors'].append(f"Confidence score calculation failed: {str(e)}")
-            
-            # Use default values if components not available
-            if 'fluency_score' not in result:
-                result['fluency_score'] = 0.0
-            if 'vocabulary_score' not in result:
-                result['vocabulary_score'] = 0.0
-            if 'confidence_score' not in result:
-                result['confidence_score'] = 0.0
-            
+                fluency_result = {}
+
             # Step 6: Grammar correction
             self._ensure_component("grammar")
             if self.grammar_corrector:
@@ -382,19 +406,65 @@ class SpeekyPipeline:
                 result['corrected_text'] = result['original_text']
                 grammar_result = {}
 
-            # Step 6.5: Confidence vs. Grammar analysis (BAS-US-11)
+            # Step 6.5: Confidence vs. Grammar analysis (US-21 / BAS-US-11)
             # Reuses fluency_result (step 5) and grammar_result (step 6) —
             # no new signal extraction, just scoring/feedback on top.
             self._ensure_component("confidence")
+            is_high_stakes = context_type in HIGH_STAKES_CONTEXT_TYPES
+            formality_tier = (
+                FormalityTier.FORMAL_HIGH_STAKES if is_high_stakes else FormalityTier.PROFESSIONAL
+            )
             if self.confidence_analyzer:
-                is_high_stakes = context_type in HIGH_STAKES_CONTEXT_TYPES
                 confidence_analysis = self.confidence_analyzer.analyze(
-                    fluency_result, grammar_result, is_high_stakes_context=is_high_stakes
+                    fluency_result, grammar_result, formality_tier=formality_tier
                 )
                 result['confidence_analysis'] = confidence_analysis
             else:
                 result['errors'].append("Confidence/grammar analyzer not available")
-            
+
+            # Step 6.6: Code-Switch Coaching (US-56/57/58)
+            self._ensure_component("code_switch")
+            if self.tolerance_wrapper:
+                tolerance_result = self.tolerance_wrapper.evaluate(
+                    session_id=learner_id,
+                    text=result['original_text'],
+                    formality_tier=formality_tier,
+                )
+                flags = tolerance_result.get("flags", [])
+
+                # US-56: classify each flag as target word / cultural term
+                classified_flags = [
+                    self.cultural_classifier.classify(f, learner_id) for f in flags
+                ]
+                result['code_switch_flags'] = classified_flags
+
+                # US-57: consolidated retry prompt for TARGET_WORD flags only
+                # (cultural terms aren't things to eliminate, so no retry
+                # drill fires on them).
+                target_flags = [
+                    f for f in classified_flags if f["category"] == "target_word"
+                ]
+                retry_result = self.retry_drill.evaluate(
+                    learner_id=learner_id,
+                    flags=target_flags,
+                    formality_tier=formality_tier,
+                    is_timed_assessment=is_timed_assessment,
+                )
+                result['retry_prompt'] = retry_result
+
+                # US-58: mastery tracking. GAP — this pipeline only sees
+                # FLAGGED words (code-switch occurrences), never "clean
+                # opportunities" (target vocabulary correctly used
+                # instead of code-switched). That signal doesn't exist
+                # anywhere in this codebase yet; without it, words can
+                # never graduate to Mastered from here alone. Logging
+                # flags only, for now — someone needs to define where
+                # the "clean opportunity" signal comes from.
+                for f in target_flags:
+                    self.mastery_tracker.record_flag(learner_id, f["token"])
+            else:
+                result['errors'].append("Code-switch coaching components not available")
+
             # Step 7: Conversational response
             self._ensure_component("conversation")
             if self.conversation_engine:
@@ -404,7 +474,7 @@ class SpeekyPipeline:
                 result['response_text'] = response
             else:
                 result['errors'].append("Conversation engine not available")
-            
+
             # Step 8: TTS for corrected text
             self._ensure_component("tts")
             if self.tts:
@@ -421,26 +491,15 @@ class SpeekyPipeline:
                     result['errors'].append(f"TTS failed: {str(e)}")
             else:
                 result['errors'].append("TTS not available")
-            
+
             logger.info("Pipeline processing complete")
             return result
-            
+
         except Exception as e:
             logger.error(f"Pipeline processing error: {e}")
-            return {
-                'timestamp': datetime.now().isoformat(),
-                'context_type': context_type,
-                'original_text': '',
-                'corrected_text': '',
-                'pronunciation_score': None,
-                'fluency_score': 0.0,
-                'grammar_errors': {},
-                'explanation': '',
-                'response_text': '',
-                'audio_filename': '',
-                'errors': [f"Pipeline error: {str(e)}"]
-            }
-    
+            result['errors'].append(f"Pipeline error: {str(e)}")
+            return result
+
     def process_batch(
         self,
         audio_files: List[str],
@@ -449,47 +508,47 @@ class SpeekyPipeline:
     ) -> List[Dict]:
         """
         Process multiple audio files in batch.
-        
+
         Args:
             audio_files: List of audio file paths
             context_type: Context type for conversation
             output_dir: Directory to save output files
-            
+
         Returns:
             List of result dictionaries
         """
         results = []
-        
+
         for audio_file in audio_files:
             try:
                 # Load audio file
                 from scipy.io import wavfile
                 sample_rate, audio = wavfile.read(audio_file)
-                
+
                 # Convert to float32 if needed
                 if audio.dtype == np.int16:
                     audio = audio.astype(np.float32) / 32768.0
                 elif audio.dtype == np.int32:
                     audio = audio.astype(np.float32) / 2147483648.0
-                
+
                 # Process
                 result = self.process(audio, sample_rate, context_type, output_dir=output_dir)
                 result['source_file'] = audio_file
                 results.append(result)
-                
+
             except Exception as e:
                 logger.error(f"Error processing {audio_file}: {e}")
                 results.append({
                     'source_file': audio_file,
                     'error': str(e)
                 })
-        
+
         return results
-    
+
     def get_status(self) -> Dict[str, bool]:
         """
         Get the status of all pipeline components.
-        
+
         Returns:
             Dictionary with component availability status
         """
@@ -503,13 +562,14 @@ class SpeekyPipeline:
             'conversation': self.conversation_engine is not None,
             'tts': self.tts is not None,
             'confidence': self.confidence_analyzer is not None,
+            'code_switch_coaching': self.tolerance_wrapper is not None,
             'ollama_available': self.conversation_engine.ollama_available if self.conversation_engine else False
         }
-    
+
     def save_result(self, result: Dict, output_path: str):
         """
         Save result to JSON file.
-        
+
         Args:
             result: Result dictionary
             output_path: Path to save JSON file
