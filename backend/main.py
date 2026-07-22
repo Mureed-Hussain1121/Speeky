@@ -31,6 +31,8 @@ from routers.conversation_routes import router as conversation_router
 from routers.interview_coach_routes import router as interview_coach_router
 from routers.resume_jd_routes import router as resume_jd_router
 from routers.session_memory_routes import router as session_memory_router
+from routers.pronunciation_routes import router as pronunciation_router
+from routers.accent_routes import router as accent_router
 from utils.app_error import AppError
 
 
@@ -81,6 +83,8 @@ app.include_router(conversation_router, prefix="/api/conversation")
 app.include_router(interview_coach_router, prefix="/api/interview-coach")
 app.include_router(session_memory_router, prefix="/api/session-memory")
 app.include_router(resume_jd_router, prefix="/api/resume-jd-intake")
+app.include_router(pronunciation_router, prefix="/api/pronunciation-coach")
+app.include_router(accent_router, prefix="/api/accent-assessment")
 
 # Local-folder avatar storage, exposed to frontend as static files
 _uploads_dir = os.path.join(os.path.dirname(__file__), "uploads")
